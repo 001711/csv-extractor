@@ -2,14 +2,12 @@ import streamlit as st
 import pandas as pd
 import zipfile
 import gzip
-import shutil
 import time
 import os
-import tempfile
 from io import BytesIO
 
 st.set_page_config(page_title="CSV 多文件批量提取器", layout="wide")
-st.title("📁 CSV 多文件批量提取工具（支持压缩包上传）")
+st.title("📁 CSV 多文件批量提取工具（支持压缩包上传、大文件优化）")
 
 # ---------- 初始化会话状态 ----------
 if "uploaded_library" not in st.session_state:
@@ -25,38 +23,38 @@ enable_sampling = st.sidebar.checkbox("启用间隔采样", value=False)
 sample_interval = 10
 if enable_sampling:
     sample_interval = st.sidebar.number_input("采样间隔（行数）", min_value=1, value=10)
+
+chunk_size = st.sidebar.number_input(
+    "分块读取行数（大文件建议减小）",
+    min_value=1000, max_value=100000, value=30000, step=5000,
+    help="每次读取的行数，内存不足或处理卡顿时请调低此值"
+)
 pack_zip = st.sidebar.checkbox("将所有结果打包为 ZIP 下载", value=True)
 
 # ---------- 辅助函数：解压上传的文件 ----------
 def extract_csv_from_upload(uploaded_file):
-    """从上传的文件中提取CSV数据，支持.csv, .zip, .gz"""
     file_name = uploaded_file.name.lower()
-    extracted_files = []  # 返回 [(filename, BytesIO), ...]
-    
-    if file_name.endswith('.csv'):
-        # 直接是CSV
-        extracted_files.append((uploaded_file.name, BytesIO(uploaded_file.getvalue())))
-    
-    elif file_name.endswith('.zip'):
-        # ZIP压缩包
-        with zipfile.ZipFile(BytesIO(uploaded_file.getvalue())) as zf:
-            for name in zf.namelist():
-                if name.lower().endswith('.csv'):
-                    data = zf.read(name)
-                    extracted_files.append((os.path.basename(name), BytesIO(data)))
-    
-    elif file_name.endswith('.gz'):
-        # GZIP压缩（通常是单个文件）
-        with gzip.GzipFile(fileobj=BytesIO(uploaded_file.getvalue())) as gz:
-            content = gz.read()
-            # 假设解压后文件名去掉.gz
-            base = uploaded_file.name[:-3] if uploaded_file.name.endswith('.gz') else uploaded_file.name
-            if not base.endswith('.csv'):
-                base += '.csv'
-            extracted_files.append((base, BytesIO(content)))
-    else:
-        st.warning(f"不支持的文件类型：{uploaded_file.name}")
-    
+    extracted_files = []
+    try:
+        if file_name.endswith('.csv'):
+            extracted_files.append((uploaded_file.name, BytesIO(uploaded_file.getvalue())))
+        elif file_name.endswith('.zip'):
+            with zipfile.ZipFile(BytesIO(uploaded_file.getvalue())) as zf:
+                for name in zf.namelist():
+                    if name.lower().endswith('.csv'):
+                        data = zf.read(name)
+                        extracted_files.append((os.path.basename(name), BytesIO(data)))
+        elif file_name.endswith('.gz'):
+            with gzip.GzipFile(fileobj=BytesIO(uploaded_file.getvalue())) as gz:
+                content = gz.read()
+                base = uploaded_file.name[:-3] if uploaded_file.name.endswith('.gz') else uploaded_file.name
+                if not base.endswith('.csv'):
+                    base += '.csv'
+                extracted_files.append((base, BytesIO(content)))
+        else:
+            st.warning(f"不支持的文件类型：{uploaded_file.name}")
+    except Exception as e:
+        st.error(f"解压文件 {uploaded_file.name} 失败：{e}")
     return extracted_files
 
 # ---------- 侧边栏：已上传文件库 ----------
@@ -82,11 +80,11 @@ if st.session_state.uploaded_library:
         st.session_state.current_files.clear()
         st.rerun()
 else:
-    st.sidebar.caption("暂无已保存的文件，上传后会自动保存。")
+    st.sidebar.caption("暂无已保存的文件。")
 
 # ---------- 主界面：上传 ----------
 st.markdown("### 第一步：上传 CSV 或压缩包（支持 .zip / .gz）")
-st.caption("💡 推荐将大 CSV 文件压缩后上传，可大幅缩短上传时间。文件会自动保存到左侧库中。")
+st.caption("💡 推荐压缩后上传。文件会自动保存到左侧库中，处理大文件请耐心等待。")
 
 uploaded_files = st.file_uploader(
     "点击选择文件（可多选）",
@@ -98,19 +96,14 @@ uploaded_files = st.file_uploader(
 if uploaded_files:
     new_files = []
     for f in uploaded_files:
-        # 检查是否已在库中
         if f.name in st.session_state.uploaded_library:
             continue
-        
-        # 模拟上传进度
         with st.status(f"正在处理 {f.name} ...", expanded=True) as upload_status:
             progress_bar = st.progress(0, text="接收文件中...")
-            # 模拟进度（实际上传已完成，给用户反馈）
             for p in range(0, 101, 25):
-                time.sleep(0.1)
+                time.sleep(0.05)
                 progress_bar.progress(p, text=f"处理进度 {p}%")
             
-            # 解压提取CSV
             extracted = extract_csv_from_upload(f)
             for csv_name, csv_io in extracted:
                 data_bytes = csv_io.getvalue()
@@ -121,10 +114,8 @@ if uploaded_files:
                 }
                 new_files.append(csv_name)
                 st.toast(f"✅ {csv_name} 已保存 ({size_mb:.1f} MB)")
-            
             progress_bar.progress(100, text="完成！")
             upload_status.update(label=f"✅ {f.name} 处理完成", state="complete")
-    
     if new_files:
         st.session_state.current_files.extend(new_files)
         st.rerun()
@@ -161,8 +152,12 @@ if st.session_state.current_files:
         # ---------- 列选择 ----------
         first_file_obj = work_files[0][0]
         first_file_obj.seek(0)
-        df_first = pd.read_csv(first_file_obj, nrows=0)
-        all_columns = df_first.columns.tolist()
+        try:
+            df_first = pd.read_csv(first_file_obj, nrows=0)
+            all_columns = df_first.columns.tolist()
+        except Exception as e:
+            st.error(f"读取列名失败：{e}")
+            st.stop()
         
         st.subheader("🔧 第二步：选择要保留的列")
         if "selected_cols" not in st.session_state:
@@ -201,23 +196,41 @@ if st.session_state.current_files:
                             file_obj.seek(0)
                             output_chunks = []
                             total_rows = 0
-                            chunk_iter = pd.read_csv(file_obj, usecols=selected_cols, chunksize=50000)
+                            
+                            # 使用 chunksize，并捕获解析错误
+                            chunk_iter = pd.read_csv(
+                                file_obj,
+                                usecols=selected_cols,
+                                chunksize=chunk_size,
+                                on_bad_lines='warn',  # 跳过损坏行
+                                encoding='utf-8',
+                                engine='python'  # Python引擎更宽容
+                            )
+                            
+                            # 限制最大迭代次数防止死循环（每文件最多处理500万行，可根据需要调整）
+                            max_iterations = 5000000 // chunk_size + 10
+                            iter_count = 0
                             
                             for chunk in chunk_iter:
+                                iter_count += 1
+                                if iter_count > max_iterations:
+                                    st.warning(f"文件 {file_name} 行数过多，已中断处理。请尝试采样或减小文件。")
+                                    break
+                                    
                                 if enable_sampling:
                                     chunk = chunk.iloc[::sample_interval]
                                 total_rows += len(chunk)
                                 output_chunks.append(chunk)
                                 
-                                current_pos = file_obj.tell()
-                                file_progress = current_pos / file_size if file_size > 0 else 1.0
-                                global_progress = (processed_bytes + current_pos) / total_bytes
-                                
+                                # 基于已处理字节估算进度（使用行数估算百分比）
+                                # 避免使用不稳定的 tell()
+                                approx_progress = min(iter_count * chunk_size / 10000, 0.99)  # 粗糙估计，到99%后直接跳到100%
+                                global_progress = (processed_bytes + file_size * approx_progress) / total_bytes
                                 progress_bar.progress(min(global_progress, 1.0), text=f"总进度 {int(global_progress*100)}%")
                                 file_status_placeholders[idx].markdown(
-                                    f"⏳ **{file_name}** - 已读取 {total_rows:,} 行 ({int(file_progress*100)}%)"
+                                    f"⏳ **{file_name}** - 已读取 {total_rows:,} 行 (~{int(approx_progress*100)}%)"
                                 )
-                            
+                                
                             processed_bytes += file_size
                             
                             if output_chunks:
@@ -237,10 +250,12 @@ if st.session_state.current_files:
                             file_status_placeholders[idx].markdown(
                                 f"✅ **{file_name}** - 完成！ {extracted_rows:,} 行，{extracted_mb:.2f} MB"
                             )
+                            
                         except Exception as e:
-                            st.error(f"❌ 处理 {file_name} 出错：{e}")
+                            st.error(f"❌ 处理 {file_name} 出错：{str(e)[:200]}")
                             file_status_placeholders[idx].markdown(f"❌ **{file_name}** - 处理失败")
                             processed_bytes += file_size
+                            continue
                     
                     progress_bar.progress(1.0, text="总进度 100%")
                     status_container.update(label="✅ 所有文件处理完成", state="complete")
