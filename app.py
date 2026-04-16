@@ -4,7 +4,6 @@ import zipfile
 import gzip
 import os
 from io import BytesIO
-import base64
 
 st.set_page_config(page_title="CSV 列提取器 (云端预览+本地运行)", layout="wide")
 st.title("📁 CSV 列提取工具（解决大文件卡死，推荐本地运行）")
@@ -19,7 +18,6 @@ if "history" not in st.session_state:
 
 # ---------- 生成可下载的本地处理脚本 ----------
 def generate_local_script(selected_columns, sample_interval=0, chunk_size=50000):
-    """返回一个完整的 Python 脚本字符串，用户保存为 .py 文件后本地运行"""
     script = f'''"""
 CSV 批量列提取工具 - 本地运行版
 使用方法：
@@ -32,25 +30,13 @@ import pandas as pd
 import os
 from pathlib import Path
 
-# ========== 用户配置 ==========
-# 需要保留的列名（已根据你在网页上的选择自动生成）
 SELECTED_COLUMNS = {selected_columns}
-
-# 采样间隔，0 表示不采样，例如 10 表示每隔 10 行取一行
 SAMPLE_INTERVAL = {sample_interval}
-
-# 分块读取大小（行数），大文件可适当调小以节省内存
 CHUNK_SIZE = {chunk_size}
-
-# 输入文件夹（默认为脚本所在目录，可修改为具体路径）
 INPUT_FOLDER = Path(__file__).parent
-
-# 输出文件夹（提取后的文件将保存在这里）
 OUTPUT_FOLDER = INPUT_FOLDER / "extracted"
-# ==============================
 
 def process_file(file_path):
-    """处理单个 CSV 文件"""
     output_chunks = []
     total_rows = 0
     try:
@@ -58,7 +44,7 @@ def process_file(file_path):
             file_path,
             usecols=SELECTED_COLUMNS,
             chunksize=CHUNK_SIZE,
-            on_bad_lines='skip',  # 跳过损坏行
+            on_bad_lines='skip',
             encoding='utf-8'
         )
         for chunk in chunk_iter:
@@ -76,16 +62,12 @@ def process_file(file_path):
         return None, 0
 
 def main():
-    # 创建输出目录
     OUTPUT_FOLDER.mkdir(exist_ok=True)
-    
-    # 获取所有 CSV 文件
     csv_files = list(INPUT_FOLDER.glob("*.csv"))
     if not csv_files:
-        print("当前文件夹未找到 CSV 文件，请将脚本放在 CSV 文件所在目录，或修改 INPUT_FOLDER。")
+        print("当前文件夹未找到 CSV 文件。")
         input("按回车键退出...")
         return
-    
     print(f"找到 {{len(csv_files)}} 个 CSV 文件，开始处理...")
     for i, file_path in enumerate(csv_files, 1):
         print(f"[{{i}}/{{len(csv_files)}}] 处理 {{file_path.name}} ...")
@@ -95,7 +77,6 @@ def main():
             df.to_csv(out_path, index=False, encoding='utf-8')
             size_mb = out_path.stat().st_size / (1024*1024)
             print(f"    完成！提取 {{rows}} 行，输出大小 {{size_mb:.2f}} MB")
-    
     print(f"\\n所有文件处理完毕！提取结果保存在: {{OUTPUT_FOLDER.resolve()}}")
     input("按回车键退出...")
 
@@ -112,26 +93,36 @@ mode = st.sidebar.radio(
     help="大文件强烈建议下载脚本到本地运行，速度快、无限制。"
 )
 
-# 采样设置（两种模式共用）
 st.sidebar.header("📊 采样设置")
 enable_sampling = st.sidebar.checkbox("启用间隔采样", value=False)
 sample_interval = 10
 if enable_sampling:
     sample_interval = st.sidebar.number_input("采样间隔（行数）", min_value=1, value=10)
 
-# 云端模式专属设置
 if mode.startswith("☁️"):
     max_rows_limit = st.sidebar.number_input(
-        "最大处理行数（防止卡死）",
-        min_value=1000, max_value=200000, value=50000, step=10000,
-        help="云端内存有限，超过此行数将自动截断。推荐使用本地脚本模式。"
+        "最大处理行数", min_value=1000, max_value=200000, value=50000, step=10000
     )
     chunk_size = st.sidebar.number_input(
         "分块大小", min_value=5000, max_value=50000, value=20000, step=5000
     )
-    st.sidebar.warning("⚠️ 云端处理大文件极易卡死，仅建议处理 <5万行的文件。")
+    st.sidebar.warning("⚠️ 云端处理大文件极易卡死，建议只处理小文件。")
 
-# ---------- 辅助函数：解压 ----------
+# ---------- 辅助函数：过滤并解压（修复虚假文件问题）----------
+def is_valid_csv_path(path):
+    """过滤掉 macOS 资源分支文件和系统隐藏文件"""
+    parts = path.split('/')
+    # 跳过 __MACOSX 目录及其子文件
+    if '__MACOSX' in parts:
+        return False
+    # 跳过 ._ 开头的资源分支文件
+    if os.path.basename(path).startswith('._'):
+        return False
+    # 跳过隐藏文件（以 . 开头但排除正常隐藏文件，通常 CSV 不会以 . 开头）
+    if os.path.basename(path).startswith('.') and not path.endswith('.csv'):
+        return False
+    return path.lower().endswith('.csv')
+
 def extract_csv_from_upload(uploaded_file):
     file_name = uploaded_file.name.lower()
     extracted = []
@@ -141,7 +132,7 @@ def extract_csv_from_upload(uploaded_file):
         elif file_name.endswith('.zip'):
             with zipfile.ZipFile(BytesIO(uploaded_file.getvalue())) as zf:
                 for name in zf.namelist():
-                    if name.lower().endswith('.csv'):
+                    if is_valid_csv_path(name):
                         data = zf.read(name)
                         extracted.append((os.path.basename(name), BytesIO(data)))
         elif file_name.endswith('.gz'):
@@ -191,14 +182,13 @@ if uploaded_files:
     for f in uploaded_files:
         if f.name in st.session_state.uploaded_library:
             continue
-        # 解压并存入库
         extracted = extract_csv_from_upload(f)
         for csv_name, csv_io in extracted:
             data_bytes = csv_io.getvalue()
             size_mb = len(data_bytes) / (1024*1024)
             st.session_state.uploaded_library[csv_name] = {"data": data_bytes, "size_mb": size_mb}
             new_files.append(csv_name)
-            st.toast(f"✅ {csv_name} 已保存")
+            st.toast(f"✅ {csv_name} 已保存 ({size_mb:.1f} MB)")
     if new_files:
         st.session_state.current_files.extend(new_files)
         st.rerun()
@@ -216,10 +206,11 @@ if st.session_state.current_files:
             st.session_state.current_files.remove(fname)
 
     if work_files:
+        total_size = sum(sz for _, sz in work_files)
         st.markdown("### 📂 已加载文件")
-        st.info(f"共 {len(work_files)} 个文件，总大小 {sum(sz for _,sz in work_files):.2f} MB")
+        st.info(f"共 {len(work_files)} 个文件，总大小 {total_size:.2f} MB")
 
-        # 预览第一个文件的前1000行（用于列选择）
+        # 预览
         first_file = work_files[0][0]
         first_file.seek(0)
         try:
@@ -242,10 +233,9 @@ if st.session_state.current_files:
         )
         st.session_state.selected_cols = selected_cols
 
-        # ---------- 根据模式显示不同操作按钮 ----------
         if mode.startswith("🚀"):
             st.markdown("### 第二步：下载本地处理脚本")
-            st.success("✅ 请将下载的 `.py` 脚本放在 CSV 文件所在文件夹，双击运行即可（需安装 Python 和 pandas）。")
+            st.success("✅ 请将下载的 `.py` 脚本放在 CSV 文件所在文件夹，双击运行即可。")
             if selected_cols:
                 script_content = generate_local_script(selected_cols, sample_interval if enable_sampling else 0)
                 st.download_button(
@@ -256,19 +246,17 @@ if st.session_state.current_files:
                 )
             else:
                 st.warning("请至少选择一列。")
-
-        else:  # 云端尽力模式
-            st.markdown("### 第二步：云端处理（有行数限制）")
+        else:
+            st.markdown("### 第二步：云端处理")
             if st.button("☁️ 开始云端提取", type="primary"):
                 if not selected_cols:
                     st.warning("请选择列")
                 else:
                     extracted_files = []
-                    total_bytes = sum(info["size_mb"]*1024*1024 for info in st.session_state.uploaded_library.values())
                     progress_bar = st.progress(0, "准备...")
                     status_text = st.empty()
-
                     processed_bytes = 0
+                    total_bytes = sum(info["size_mb"]*1024*1024 for info in st.session_state.uploaded_library.values())
                     for idx, (fobj, _) in enumerate(work_files):
                         fname = fobj.name
                         fsize = len(st.session_state.uploaded_library[fname]["data"])
@@ -286,9 +274,8 @@ if st.session_state.current_files:
                                     chunk = chunk.iloc[::sample_interval]
                                 total_rows += len(chunk)
                                 output_chunks.append(chunk)
-                                # 简单进度估算
-                                processed_bytes += len(chunk) * 100  # 粗略
-                                prog = min(processed_bytes / total_bytes, 0.99)
+                                processed_bytes += len(chunk) * 100
+                                prog = min(processed_bytes / total_bytes, 0.99) if total_bytes else 0
                                 progress_bar.progress(prog, f"{fname} 已读 {total_rows} 行")
                             if output_chunks:
                                 result_df = pd.concat(output_chunks, ignore_index=True)
@@ -301,11 +288,19 @@ if st.session_state.current_files:
                         except Exception as e:
                             st.error(f"{fname} 失败: {e}")
                         processed_bytes += fsize
-
                     progress_bar.progress(1.0, "完成")
                     status_text.empty()
                     st.success("处理完成！")
                     for fname, fdata, fmbs, frows in extracted_files:
                         st.download_button(f"⬇️ {fname} ({fmbs:.2f} MB)", fdata, fname, key=fname)
 
-# ---------- 历史记录侧边栏（略，保持简洁）----------
+# ---------- 历史记录侧边栏（保持简洁）----------
+st.sidebar.header("📂 提取历史")
+if st.session_state.history:
+    for i, item in enumerate(reversed(st.session_state.history)):
+        idx = len(st.session_state.history) - 1 - i
+        with st.sidebar.expander(f"{item['name']} ({item['size_mb']:.2f} MB)"):
+            st.write(f"行数：{item['rows']:,}")
+            st.download_button("⬇️ 下载", data=item['data'], file_name=item['name'], key=f"hist_dl_{idx}")
+else:
+    st.sidebar.write("暂无提取记录。")
