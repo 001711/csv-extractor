@@ -16,9 +16,9 @@ if enable_sampling:
 
 pack_zip = st.sidebar.checkbox("将所有结果打包为 ZIP 下载", value=True)
 
-# ---------- 主界面 ----------
+# ---------- 主界面：多文件上传 ----------
 st.markdown("### 第一步：上传 CSV 文件")
-st.caption("💡 大文件（如 200MB）上传时浏览器可能需要几十秒，请留意浏览器底部的上传进度，不要关闭页面。")
+st.caption("💡 大文件上传时请留意浏览器底部的上传进度，上传完成后会有提示。")
 
 uploaded_files = st.file_uploader(
     "点击上传一个或多个 CSV 文件",
@@ -27,40 +27,40 @@ uploaded_files = st.file_uploader(
     key="file_uploader"
 )
 
-# ---------- 上传成功提示 ----------
-if uploaded_files and "upload_success_shown" not in st.session_state:
-    st.session_state.upload_success_shown = True
-    total_size_mb = sum(len(f.getvalue()) / (1024 * 1024) for f in uploaded_files)
-    st.toast(f"✅ 上传成功！已接收 {len(uploaded_files)} 个文件，总大小 {total_size_mb:.2f} MB", icon="✅")
-    # 可选：播放一个短暂的庆祝音效（仅本地有效，云端可能无声，但无害）
-    # st.balloons()
-
-# 重置上传成功标记（当文件列表变化时）
-if not uploaded_files and "upload_success_shown" in st.session_state:
-    del st.session_state.upload_success_shown
+# 上传成功提示
+if uploaded_files:
+    if "last_file_count" not in st.session_state:
+        st.session_state.last_file_count = 0
+    if len(uploaded_files) != st.session_state.last_file_count:
+        total_mb = sum(len(f.getvalue()) / (1024 * 1024) for f in uploaded_files)
+        st.toast(f"✅ 已接收 {len(uploaded_files)} 个文件，总大小 {total_mb:.2f} MB", icon="✅")
+        st.session_state.last_file_count = len(uploaded_files)
 
 if uploaded_files:
     file_sizes = [len(f.getvalue()) for f in uploaded_files]
     total_size_bytes = sum(file_sizes)
     total_size_mb = total_size_bytes / (1024 * 1024)
-    st.info(f"📦 已加载 {len(uploaded_files)} 个文件，总大小约 {total_size_mb:.2f} MB")
 
-    # 预览第一个文件
+    st.subheader("📊 文件预览（每个文件的前 100 行）")
+    # 为每个文件创建预览卡片
+    for idx, uploaded_file in enumerate(uploaded_files):
+        file_size_mb = file_sizes[idx] / (1024 * 1024)
+        with st.expander(f"📄 {uploaded_file.name}  ({file_size_mb:.2f} MB)", expanded=(idx == 0)):
+            try:
+                uploaded_file.seek(0)
+                df_preview = pd.read_csv(uploaded_file, nrows=100)
+                st.dataframe(df_preview, use_container_width=True)
+                st.caption(f"共 {len(df_preview.columns)} 列")
+            except Exception as e:
+                st.error(f"预览失败：{e}")
+
+    # 列选择：基于第一个文件（假设所有文件列结构相同）
     first_file = uploaded_files[0]
     first_file.seek(0)
-    try:
-        df_preview = pd.read_csv(first_file, nrows=100)
-    except Exception as e:
-        st.error(f"预览失败：{e}")
-        st.stop()
+    df_first = pd.read_csv(first_file, nrows=0)  # 只读列名
+    all_columns = df_first.columns.tolist()
 
-    st.subheader("📊 数据预览（第一个文件的前100行）")
-    st.dataframe(df_preview, use_container_width=True)
-
-    all_columns = df_preview.columns.tolist()
-    st.write(f"共有 {len(all_columns)} 列")
-
-    st.subheader("🔧 第二步：选择要保留的列")
+    st.subheader("🔧 第二步：选择要保留的列（应用于所有文件）")
     if "selected_cols" not in st.session_state:
         st.session_state.selected_cols = all_columns[: min(3, len(all_columns))]
 
@@ -81,9 +81,16 @@ if uploaded_files:
 
             extracted_files = []
 
-            with st.status("正在处理文件...", expanded=True) as status:
+            # 使用 status 展示整体进度
+            with st.status("正在处理文件...", expanded=True) as status_container:
+                # 全局进度条
                 progress_bar = st.progress(0, text="初始化...")
-                percent_text = st.empty()
+                # 为每个文件创建状态占位符
+                file_status_placeholders = []
+                for f in uploaded_files:
+                    placeholder = st.empty()
+                    file_status_placeholders.append(placeholder)
+                    placeholder.markdown(f"⏳ **{f.name}** - 等待处理")
 
                 processed_bytes = 0
                 total_files = len(uploaded_files)
@@ -91,8 +98,10 @@ if uploaded_files:
                 for idx, uploaded_file in enumerate(uploaded_files):
                     file_name = uploaded_file.name
                     file_size = file_sizes[idx]
+                    file_size_mb = file_size / (1024 * 1024)
 
-                    status.update(label=f"⏳ 正在处理 {file_name} ({idx+1}/{total_files})")
+                    # 更新当前文件状态为“处理中”
+                    file_status_placeholders[idx].markdown(f"⏳ **{file_name}** - 处理中 (0%)")
 
                     try:
                         uploaded_file.seek(0)
@@ -112,15 +121,19 @@ if uploaded_files:
                             total_rows += len(chunk)
                             output_chunks.append(chunk)
 
+                            # 更新进度
                             current_pos = uploaded_file.tell()
                             file_progress = current_pos / file_size if file_size > 0 else 1.0
                             global_progress = (processed_bytes + current_pos) / total_size_bytes
 
                             progress_bar.progress(
                                 min(global_progress, 1.0),
-                                text=f"📄 {file_name} - 已读取 {total_rows:,} 行"
+                                text=f"总进度：{int(global_progress * 100)}%"
                             )
-                            percent_text.markdown(f"**当前文件完成度：{int(file_progress * 100)}%**")
+                            # 更新当前文件状态
+                            file_status_placeholders[idx].markdown(
+                                f"⏳ **{file_name}** - 已读取 {total_rows:,} 行 ({int(file_progress * 100)}%)"
+                            )
 
                         processed_bytes += file_size
 
@@ -139,20 +152,23 @@ if uploaded_files:
                         out_name = f"extracted_{file_name}"
                         extracted_files.append((out_name, extracted_data, extracted_mb, extracted_rows))
 
-                        time.sleep(0.2)  # 让进度条停留片刻
+                        # 更新为完成状态
+                        file_status_placeholders[idx].markdown(
+                            f"✅ **{file_name}** - 完成！ {extracted_rows:,} 行，{extracted_mb:.2f} MB"
+                        )
 
                     except Exception as e:
                         st.error(f"❌ 处理 {file_name} 出错：{e}")
+                        file_status_placeholders[idx].markdown(f"❌ **{file_name}** - 处理失败")
                         processed_bytes += file_size
                         continue
 
-                progress_bar.progress(1.0, text="✅ 所有文件处理完成！")
-                percent_text.markdown("**完成度：100%**")
-                status.update(label="✅ 处理完成", state="complete")
+                progress_bar.progress(1.0, text="总进度：100%")
+                status_container.update(label="✅ 所有文件处理完成", state="complete")
                 time.sleep(0.5)
 
             st.success(f"✅ 批量提取完成！共处理 {total_files} 个文件。")
-            st.balloons()  # 庆祝动画
+            st.balloons()
 
             # ---------- 结果展示 ----------
             st.subheader("📦 提取结果")
@@ -188,13 +204,13 @@ if uploaded_files:
                     mime="application/zip"
                 )
 
-            # 自动保存历史
+            # 自动保存到历史
             for fname, fdata, fmbs, frows in extracted_files:
                 st.session_state.history.append({
                     "name": fname, "data": fdata, "size_mb": fmbs, "rows": frows
                 })
 
-# ---------- 历史记录侧边栏 ----------
+# ---------- 侧边栏：历史记录 ----------
 st.sidebar.header("📂 已保存的文件历史")
 if "history" not in st.session_state:
     st.session_state.history = []
