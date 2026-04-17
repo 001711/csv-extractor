@@ -13,7 +13,7 @@ if "current_files" not in st.session_state:
 if "extract_history" not in st.session_state:
     st.session_state.extract_history = []
 if "preview_sample_interval" not in st.session_state:
-    st.session_state.preview_sample_interval = 0  # 0 表示不采样，使用原始预览
+    st.session_state.preview_sample_interval = 0
 if "refresh_preview" not in st.session_state:
     st.session_state.refresh_preview = False
 
@@ -136,7 +136,6 @@ if uploaded_files:
             st.toast(f"✅ {f.name} 已保存 ({size_mb:.1f} MB)")
     if new_files:
         st.session_state.current_files.extend(new_files)
-        # 新文件上传时重置预览采样状态为原始
         st.session_state.preview_sample_interval = 0
         st.session_state.refresh_preview = False
         st.rerun()
@@ -166,7 +165,6 @@ if st.session_state.current_files:
                 try:
                     fobj.seek(0)
                     if preview_interval > 0:
-                        # 读取足够多的行以保证采样后仍有足够预览行数
                         read_rows = preview_interval * 100
                         df_raw = pd.read_csv(fobj, nrows=read_rows)
                         df_preview = df_raw.iloc[::preview_interval].head(100)
@@ -174,7 +172,7 @@ if st.session_state.current_files:
                     else:
                         df_preview = pd.read_csv(fobj, nrows=100)
                         caption = f"共 {len(df_preview.columns)} 列，显示前 100 行"
-                    st.dataframe(df_preview, use_container_width=True)
+                    st.dataframe(df_preview, width='stretch')   # 已更新参数
                     st.caption(caption)
                 except Exception as e:
                     st.error(f"预览失败：{e}")
@@ -218,7 +216,7 @@ if st.session_state.current_files:
             else:
                 st.warning("请至少选择一列。")
 
-        else:  # 云端全量处理
+        else:
             st.markdown("### 第二步：云端全量处理")
             if st.button("☁️ 开始云端提取（全量）", type="primary"):
                 if not selected_cols:
