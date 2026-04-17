@@ -3,7 +3,7 @@ import pandas as pd
 from io import BytesIO
 
 st.set_page_config(page_title="CSV 列提取器", layout="wide")
-st.title("📁 CSV 列提取工具（全量处理 + 提取历史）")
+st.title("📁 CSV 列提取工具（全量处理 + 提取历史 + 预览采样刷新）")
 
 # ---------- 初始化会话状态 ----------
 if "uploaded_files_data" not in st.session_state:
@@ -12,6 +12,10 @@ if "current_files" not in st.session_state:
     st.session_state.current_files = []
 if "extract_history" not in st.session_state:
     st.session_state.extract_history = []
+if "preview_sample_interval" not in st.session_state:
+    st.session_state.preview_sample_interval = 0  # 0 表示不采样，使用原始预览
+if "refresh_preview" not in st.session_state:
+    st.session_state.refresh_preview = False
 
 # ---------- 侧边栏：模式选择 ----------
 st.sidebar.header("⚙️ 运行模式")
@@ -27,6 +31,12 @@ enable_sampling = st.sidebar.checkbox("启用间隔采样", value=False)
 sample_interval = 10
 if enable_sampling:
     sample_interval = st.sidebar.number_input("采样间隔（行数）", min_value=1, value=10)
+
+# 刷新预览按钮
+if st.sidebar.button("🔄 刷新预览（应用当前采样）"):
+    st.session_state.preview_sample_interval = sample_interval if enable_sampling else 0
+    st.session_state.refresh_preview = True
+    st.rerun()
 
 if mode.startswith("☁️"):
     chunk_size = st.sidebar.number_input(
@@ -126,6 +136,9 @@ if uploaded_files:
             st.toast(f"✅ {f.name} 已保存 ({size_mb:.1f} MB)")
     if new_files:
         st.session_state.current_files.extend(new_files)
+        # 新文件上传时重置预览采样状态为原始
+        st.session_state.preview_sample_interval = 0
+        st.session_state.refresh_preview = False
         st.rerun()
 
 # ---------- 显示当前工作区文件 ----------
@@ -145,14 +158,24 @@ if st.session_state.current_files:
         st.markdown("### 📂 已加载文件")
         st.info(f"共 {len(work_files)} 个文件，总大小 {total_size:.2f} MB")
 
-        st.subheader("📄 文件预览（每个文件前100行）")
+        st.subheader("📄 文件预览（每个文件前若干行，点击刷新可应用采样）")
+        preview_interval = st.session_state.preview_sample_interval
+
         for idx, (fobj, size_mb) in enumerate(work_files):
             with st.expander(f"📄 {fobj.name} ({size_mb:.2f} MB)", expanded=(idx == 0)):
                 try:
                     fobj.seek(0)
-                    df_preview = pd.read_csv(fobj, nrows=100)
+                    if preview_interval > 0:
+                        # 读取足够多的行以保证采样后仍有足够预览行数
+                        read_rows = preview_interval * 100
+                        df_raw = pd.read_csv(fobj, nrows=read_rows)
+                        df_preview = df_raw.iloc[::preview_interval].head(100)
+                        caption = f"应用采样间隔 {preview_interval}，显示前 {len(df_preview)} 行（共读取前 {read_rows} 行）"
+                    else:
+                        df_preview = pd.read_csv(fobj, nrows=100)
+                        caption = f"共 {len(df_preview.columns)} 列，显示前 100 行"
                     st.dataframe(df_preview, use_container_width=True)
-                    st.caption(f"共 {len(df_preview.columns)} 列，显示前 100 行")
+                    st.caption(caption)
                 except Exception as e:
                     st.error(f"预览失败：{e}")
 
@@ -212,7 +235,6 @@ if st.session_state.current_files:
                             fobj.seek(0)
                             output_chunks = []
                             total_rows = 0
-                            # 不传入 nrows，读取全部行
                             chunk_iter = pd.read_csv(
                                 fobj,
                                 usecols=selected_cols,
@@ -262,7 +284,6 @@ if st.session_state.current_files:
                                     mime="text/csv",
                                     key=f"dl_{item['name']}"
                                 )
-                            # 保存到历史
                             st.session_state.extract_history.append(item)
                             st.toast(f"已保存 {item['name']} 到提取历史")
                     else:
