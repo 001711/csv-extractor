@@ -5,7 +5,7 @@ import os
 from io import BytesIO
 
 st.set_page_config(page_title="CSV 列提取器", layout="wide")
-st.title("📁 CSV 列提取工具（解压完成确认 · 人工上限）")
+st.title("📁 CSV 列提取工具（解压确认 · 自动清理压缩包）")
 
 # ---------- 初始化会话状态 ----------
 if "uploaded_files_data" not in st.session_state:
@@ -17,7 +17,7 @@ if "extract_history" not in st.session_state:
 if "preview_sample_interval" not in st.session_state:
     st.session_state.preview_sample_interval = 0
 if "zip_extracted_confirm" not in st.session_state:
-    st.session_state.zip_extracted_confirm = False  # 是否已完成解压等待确认
+    st.session_state.zip_extracted_confirm = False
 
 # ---------- 侧边栏：采样设置 ----------
 st.sidebar.header("📊 采样设置")
@@ -106,14 +106,13 @@ uploaded_files = st.file_uploader(
     key="file_uploader"
 )
 
-# 如果已经完成解压等待确认，显示确认对话框
+# 如果已完成解压等待确认，显示确认对话框（同时提示压缩包已删除）
 if st.session_state.zip_extracted_confirm:
-    st.success("🎉 压缩包解压完成！")
-    if st.button("✅ 确定", type="primary"):
-        # 清除确认状态，刷新页面进入预览
+    st.success("🎉 压缩包解压完成！压缩包已从临时存储中删除。")
+    if st.button("✅ 确定，进入预览", type="primary"):
         st.session_state.zip_extracted_confirm = False
         st.rerun()
-    st.stop()  # 暂停渲染，强制用户点击确定
+    st.stop()  # 暂停渲染，强制用户确认
 
 if uploaded_files:
     new_files = []
@@ -137,16 +136,13 @@ if uploaded_files:
                     new_files.append(csv_name)
                     st.toast(f"✅ {csv_name} 已提取 ({size_mb:.1f} MB)")
                 zip_status.update(label=f"✅ {f.name} 完成", state="complete")
-                # 标记等待确认
                 st.session_state.zip_extracted_confirm = True
 
     if new_files:
         st.session_state.current_files.extend(new_files)
-    # 如果有 ZIP 被处理并标记了确认，则停止后续渲染，显示确认对话框
     if st.session_state.zip_extracted_confirm:
         st.rerun()
     else:
-        # 只有纯 CSV 上传时直接刷新预览
         st.rerun()
 
 # ---------- 显示工作区文件 ----------
