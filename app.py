@@ -5,7 +5,7 @@ import os
 from io import BytesIO
 
 st.set_page_config(page_title="CSV 列提取器", layout="wide")
-st.title("📁 CSV 列提取工具（支持ZIP压缩包 · 极速解析 · 提取历史）")
+st.title("📁 CSV 列提取工具（支持ZIP · 逐个解压反馈 · 提取历史）")
 
 # ---------- 初始化会话状态 ----------
 if "uploaded_files_data" not in st.session_state:
@@ -40,24 +40,61 @@ chunk_size = st.sidebar.number_input(
 )
 st.sidebar.info("💡 云端将处理完整文件（全量），大文件请耐心等待。")
 
-# ---------- 辅助函数：解压 ZIP ----------
-def extract_csv_from_zip(zip_file):
-    """从上传的ZIP文件中提取所有CSV，返回 [(文件名, BytesIO对象), ...]"""
-    extracted = []
+# ---------- 辅助函数：逐个解压 ZIP 并显示进度 ----------
+def extract_csv_from_zip_with_progress(zip_file, existing_names, status_container):
+    """
+    逐个解压ZIP中的CSV文件，显示进度，遇到重名立即停止。
+    返回: (extracted_files_dict, error_message)
+    - extracted_files_dict: {文件名: BytesIO对象}
+    - error_message: 错误或重名提示，正常为None
+    """
+    extracted = {}
     try:
         with zipfile.ZipFile(BytesIO(zip_file.getvalue())) as zf:
+            # 第一步：获取所有有效的CSV文件名（过滤系统文件）
+            all_names = []
             for name in zf.namelist():
-                # 跳过macOS系统隐藏文件和目录
                 if name.startswith('__MACOSX/') or name.startswith('._'):
                     continue
                 if name.lower().endswith('.csv'):
-                    data = zf.read(name)
-                    # 使用纯文件名，避免路径干扰
                     fname = os.path.basename(name)
-                    extracted.append((fname, BytesIO(data)))
+                    all_names.append((name, fname))
+            
+            total = len(all_names)
+            if total == 0:
+                return {}, "ZIP 中没有找到 CSV 文件。"
+            
+            status_container.info(f"📦 ZIP 中共发现 {total} 个 CSV 文件，开始逐个解压...")
+            progress_bar = st.progress(0, text="准备解压...")
+            
+            # 第二步：先检查是否有重名
+            duplicates = []
+            for _, fname in all_names:
+                if fname in existing_names:
+                    duplicates.append(fname)
+            if duplicates:
+                progress_bar.empty()
+                return {}, f"ZIP 中包含与文件库重名的文件：{', '.join(duplicates[:5])}{'...' if len(duplicates)>5 else ''}，已停止解压。"
+            
+            # 第三步：逐个解压并更新进度
+            for idx, (arc_name, fname) in enumerate(all_names, 1):
+                progress_bar.progress(idx / total, text=f"正在解压 {idx}/{total}: {fname}")
+                # 处理重名（理论上不会进入这里，但保留检查）
+                final_name = fname
+                counter = 1
+                while final_name in existing_names or final_name in extracted:
+                    base, ext = os.path.splitext(fname)
+                    final_name = f"{base}_{counter}{ext}"
+                    counter += 1
+                data = zf.read(arc_name)
+                extracted[final_name] = BytesIO(data)
+            
+            progress_bar.progress(1.0, text=f"✅ 解压完成，共提取 {len(extracted)} 个文件")
+            status_container.success(f"✅ ZIP 解压完成，成功提取 {len(extracted)} 个 CSV 文件。")
+            progress_bar.empty()
+            return extracted, None
     except Exception as e:
-        st.error(f"解压 ZIP 失败：{e}")
-    return extracted
+        return {}, f"解压 ZIP 失败：{e}"
 
 # ---------- 主界面：上传 CSV / ZIP ----------
 st.markdown("### 第一步：上传 CSV 或 ZIP 压缩包")
@@ -69,44 +106,56 @@ uploaded_files = st.file_uploader(
 
 if uploaded_files:
     new_files = []
+    existing_names = set(st.session_state.uploaded_files_data.keys())
+    stop_processing = False
+
     for f in uploaded_files:
+        if stop_processing:
+            break
         fname_lower = f.name.lower()
-        # 处理 CSV
+        
+        # --- 处理单个 CSV ---
         if fname_lower.endswith('.csv'):
-            if f.name not in st.session_state.uploaded_files_data:
-                data_bytes = f.getvalue()
-                size_mb = len(data_bytes) / (1024 * 1024)
-                st.session_state.uploaded_files_data[f.name] = {
-                    "data": data_bytes,
-                    "size_mb": size_mb
-                }
-                new_files.append(f.name)
-                st.toast(f"✅ {f.name} 已保存 ({size_mb:.1f} MB)")
-        # 处理 ZIP
+            if f.name in existing_names:
+                st.warning(f"文件 {f.name} 已存在于文件库，跳过上传。")
+                continue
+            data_bytes = f.getvalue()
+            size_mb = len(data_bytes) / (1024 * 1024)
+            st.session_state.uploaded_files_data[f.name] = {
+                "data": data_bytes,
+                "size_mb": size_mb
+            }
+            new_files.append(f.name)
+            st.toast(f"✅ {f.name} 已保存 ({size_mb:.1f} MB)")
+        
+        # --- 处理 ZIP 压缩包（带进度）---
         elif fname_lower.endswith('.zip'):
-            extracted = extract_csv_from_zip(f)
-            for csv_name, csv_io in extracted:
-                # 避免重名覆盖（如果已存在同名文件，加后缀）
-                base, ext = os.path.splitext(csv_name)
-                final_name = csv_name
-                counter = 1
-                while final_name in st.session_state.uploaded_files_data:
-                    final_name = f"{base}_{counter}{ext}"
-                    counter += 1
-                data_bytes = csv_io.getvalue()
-                size_mb = len(data_bytes) / (1024 * 1024)
-                st.session_state.uploaded_files_data[final_name] = {
-                    "data": data_bytes,
-                    "size_mb": size_mb
-                }
-                new_files.append(final_name)
-                st.toast(f"✅ {final_name} 已从 ZIP 中提取 ({size_mb:.1f} MB)")
+            with st.status(f"正在处理压缩包 {f.name} ...", expanded=True) as zip_status:
+                extracted_dict, error_msg = extract_csv_from_zip_with_progress(
+                    f, existing_names, zip_status
+                )
+                if error_msg:
+                    st.warning(error_msg)
+                    zip_status.update(label=f"❌ {f.name} 处理失败", state="error")
+                    stop_processing = True
+                    break
+                else:
+                    for csv_name, csv_io in extracted_dict.items():
+                        data_bytes = csv_io.getvalue()
+                        size_mb = len(data_bytes) / (1024 * 1024)
+                        st.session_state.uploaded_files_data[csv_name] = {
+                            "data": data_bytes,
+                            "size_mb": size_mb
+                        }
+                        new_files.append(csv_name)
+                        st.toast(f"✅ {csv_name} 已从 ZIP 提取 ({size_mb:.1f} MB)")
+                    zip_status.update(label=f"✅ {f.name} 解压完成", state="complete")
 
     if new_files:
         st.session_state.current_files.extend(new_files)
         st.session_state.preview_sample_interval = 0
         st.session_state.refresh_preview = False
-        st.rerun()
+    st.rerun()
 
 # ---------- 显示当前工作区文件 ----------
 if st.session_state.current_files:
