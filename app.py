@@ -5,7 +5,7 @@ import os
 from io import BytesIO
 
 st.set_page_config(page_title="CSV 列提取器", layout="wide")
-st.title("📁 CSV 列提取工具（修复死循环 · 稳定解压）")
+st.title("📁 CSV 列提取工具（人工设置解压上限 · 杜绝卡死）")
 
 # ---------- 初始化会话状态 ----------
 if "uploaded_files_data" not in st.session_state:
@@ -33,20 +33,24 @@ chunk_size = st.sidebar.number_input(
     help="每次读取的行数，大文件可调小节省内存。"
 )
 
-# ---------- 解压安全设置 ----------
-MAX_FILES_IN_ZIP = 100  # 硬性上限，防止异常压缩包导致无限循环
-st.sidebar.info(f"💡 单个 ZIP 最多解压 {MAX_FILES_IN_ZIP} 个 CSV 文件。")
+# ---------- 🆕 人工设置解压上限 ----------
+st.sidebar.header("📦 解压安全设置")
+max_files_to_extract = st.sidebar.number_input(
+    "本次最多解压文件数（防止卡死）",
+    min_value=1, max_value=500, value=10, step=5,
+    help="ZIP 压缩包中 CSV 文件数量超过此值时，将只解压前 N 个。建议从小值开始尝试。"
+)
+st.sidebar.caption(f"当前设置：最多解压 {max_files_to_extract} 个文件。")
 
-# ---------- 辅助函数：稳定解压 ----------
-def extract_csv_from_zip_safe(zip_file, status_container):
+# ---------- 辅助函数：安全解压（使用人工上限）----------
+def extract_csv_with_limit(zip_file, limit, status_container):
     """
-    安全解压 ZIP，强制上限保护，单个文件失败不影响整体。
-    返回: (extracted_dict, total_in_zip, extracted_count)
+    解压 ZIP，最多提取 limit 个 CSV 文件，逐个更新进度，绝对有限循环。
     """
     extracted = {}
     try:
         with zipfile.ZipFile(BytesIO(zip_file.getvalue())) as zf:
-            # 1. 获取所有有效 CSV 条目（过滤系统文件）
+            # 收集有效 CSV 条目
             entries = []
             for name in zf.namelist():
                 if name.startswith('__MACOSX/') or name.startswith('._'):
@@ -55,26 +59,24 @@ def extract_csv_from_zip_safe(zip_file, status_container):
                     fname = os.path.basename(name)
                     entries.append((name, fname))
             
-            total_in_zip = len(entries)
-            if total_in_zip == 0:
+            total = len(entries)
+            if total == 0:
                 status_container.warning("ZIP 中没有找到 CSV 文件。")
-                return {}, 0, 0
+                return {}, total, 0
             
-            # 2. 应用上限
-            extract_limit = min(total_in_zip, MAX_FILES_IN_ZIP)
-            status_container.info(f"📦 ZIP 中共 {total_in_zip} 个 CSV，将解压前 {extract_limit} 个...")
+            # 应用人工上限
+            extract_count = min(total, limit)
+            status_container.info(f"📦 ZIP 中共 {total} 个 CSV，本次将解压前 {extract_count} 个。")
             progress_bar = st.progress(0, text="准备解压...")
             
-            # 用于避免内部重名
             used_names = set()
-            success_count = 0
+            success = 0
             
-            # 3. 逐个解压（绝对有限循环）
-            for idx, (arc_name, original_fname) in enumerate(entries[:extract_limit], 1):
-                progress_bar.progress(idx / extract_limit, text=f"解压 {idx}/{extract_limit}: {original_fname}")
+            for idx, (arc_name, original_fname) in enumerate(entries[:extract_count], 1):
+                progress_bar.progress(idx / extract_count, text=f"解压 {idx}/{extract_count}: {original_fname}")
                 try:
                     data = zf.read(arc_name)
-                    # 处理重名
+                    # 自动重命名冲突
                     final_name = original_fname
                     counter = 1
                     while final_name in used_names:
@@ -83,20 +85,20 @@ def extract_csv_from_zip_safe(zip_file, status_container):
                         counter += 1
                     used_names.add(final_name)
                     extracted[final_name] = BytesIO(data)
-                    success_count += 1
+                    success += 1
                 except Exception as e:
-                    st.warning(f"跳过文件 {original_fname}：读取失败 ({str(e)[:50]})")
+                    st.warning(f"跳过 {original_fname}：{str(e)[:50]}")
                     continue
             
             progress_bar.progress(1.0, text="✅ 解压完成")
-            if total_in_zip > MAX_FILES_IN_ZIP:
-                status_container.success(f"✅ 已解压前 {MAX_FILES_IN_ZIP} 个文件（共 {total_in_zip} 个），达到安全上限自动停止。")
+            if total > limit:
+                status_container.success(f"✅ 已解压前 {limit} 个文件（共 {total} 个），达到人工上限自动停止。")
             else:
-                status_container.success(f"✅ 成功解压 {success_count} 个 CSV 文件。")
+                status_container.success(f"✅ 成功解压 {success} 个 CSV 文件。")
             progress_bar.empty()
-            return extracted, total_in_zip, success_count
+            return extracted, total, success
     except Exception as e:
-        status_container.error(f"解压 ZIP 失败：{e}")
+        status_container.error(f"解压失败：{e}")
         return {}, 0, 0
 
 # ---------- 主界面：上传 ----------
@@ -119,7 +121,9 @@ if uploaded_files:
             st.toast(f"✅ {f.name} 已保存 ({size_mb:.1f} MB)")
         elif fname_lower.endswith('.zip'):
             with st.status(f"处理 {f.name} ...", expanded=True) as zip_status:
-                extracted_dict, total, success = extract_csv_from_zip_safe(f, zip_status)
+                extracted_dict, total, success = extract_csv_with_limit(
+                    f, max_files_to_extract, zip_status
+                )
                 for csv_name, csv_io in extracted_dict.items():
                     data_bytes = csv_io.getvalue()
                     size_mb = len(data_bytes) / (1024 * 1024)
