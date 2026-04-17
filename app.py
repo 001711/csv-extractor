@@ -5,7 +5,7 @@ import os
 from io import BytesIO
 
 st.set_page_config(page_title="CSV 列提取器", layout="wide")
-st.title("📁 CSV 列提取工具（人工设置解压上限 · 杜绝卡死）")
+st.title("📁 CSV 列提取工具（解压完成确认 · 人工上限）")
 
 # ---------- 初始化会话状态 ----------
 if "uploaded_files_data" not in st.session_state:
@@ -16,6 +16,8 @@ if "extract_history" not in st.session_state:
     st.session_state.extract_history = []
 if "preview_sample_interval" not in st.session_state:
     st.session_state.preview_sample_interval = 0
+if "zip_extracted_confirm" not in st.session_state:
+    st.session_state.zip_extracted_confirm = False  # 是否已完成解压等待确认
 
 # ---------- 侧边栏：采样设置 ----------
 st.sidebar.header("📊 采样设置")
@@ -33,24 +35,22 @@ chunk_size = st.sidebar.number_input(
     help="每次读取的行数，大文件可调小节省内存。"
 )
 
-# ---------- 🆕 人工设置解压上限 ----------
+# ---------- 人工设置解压上限 ----------
 st.sidebar.header("📦 解压安全设置")
 max_files_to_extract = st.sidebar.number_input(
-    "本次最多解压文件数（防止卡死）",
+    "本次最多解压文件数",
     min_value=1, max_value=500, value=10, step=5,
-    help="ZIP 压缩包中 CSV 文件数量超过此值时，将只解压前 N 个。建议从小值开始尝试。"
+    help="ZIP 中 CSV 数量超过此值时，只解压前 N 个。"
 )
-st.sidebar.caption(f"当前设置：最多解压 {max_files_to_extract} 个文件。")
 
-# ---------- 辅助函数：安全解压（使用人工上限）----------
+# ---------- 辅助函数：解压并显示进度 ----------
 def extract_csv_with_limit(zip_file, limit, status_container):
     """
-    解压 ZIP，最多提取 limit 个 CSV 文件，逐个更新进度，绝对有限循环。
+    返回: (extracted_dict, total_in_zip, extracted_count)
     """
     extracted = {}
     try:
         with zipfile.ZipFile(BytesIO(zip_file.getvalue())) as zf:
-            # 收集有效 CSV 条目
             entries = []
             for name in zf.namelist():
                 if name.startswith('__MACOSX/') or name.startswith('._'):
@@ -58,25 +58,21 @@ def extract_csv_with_limit(zip_file, limit, status_container):
                 if name.lower().endswith('.csv'):
                     fname = os.path.basename(name)
                     entries.append((name, fname))
-            
             total = len(entries)
             if total == 0:
-                status_container.warning("ZIP 中没有找到 CSV 文件。")
+                status_container.warning("ZIP 中没有 CSV 文件。")
                 return {}, total, 0
-            
-            # 应用人工上限
+
             extract_count = min(total, limit)
-            status_container.info(f"📦 ZIP 中共 {total} 个 CSV，本次将解压前 {extract_count} 个。")
+            status_container.info(f"📦 ZIP 中共 {total} 个 CSV，将解压前 {extract_count} 个。")
             progress_bar = st.progress(0, text="准备解压...")
-            
             used_names = set()
             success = 0
-            
+
             for idx, (arc_name, original_fname) in enumerate(entries[:extract_count], 1):
                 progress_bar.progress(idx / extract_count, text=f"解压 {idx}/{extract_count}: {original_fname}")
                 try:
                     data = zf.read(arc_name)
-                    # 自动重命名冲突
                     final_name = original_fname
                     counter = 1
                     while final_name in used_names:
@@ -89,13 +85,13 @@ def extract_csv_with_limit(zip_file, limit, status_container):
                 except Exception as e:
                     st.warning(f"跳过 {original_fname}：{str(e)[:50]}")
                     continue
-            
+
             progress_bar.progress(1.0, text="✅ 解压完成")
+            progress_bar.empty()
             if total > limit:
-                status_container.success(f"✅ 已解压前 {limit} 个文件（共 {total} 个），达到人工上限自动停止。")
+                status_container.success(f"✅ 已解压前 {limit} 个文件（共 {total} 个），达到人工上限。")
             else:
                 status_container.success(f"✅ 成功解压 {success} 个 CSV 文件。")
-            progress_bar.empty()
             return extracted, total, success
     except Exception as e:
         status_container.error(f"解压失败：{e}")
@@ -106,8 +102,18 @@ st.markdown("### 第一步：上传 CSV 或 ZIP 压缩包")
 uploaded_files = st.file_uploader(
     "支持 .csv 和 .zip（可多选）",
     type=["csv", "zip"],
-    accept_multiple_files=True
+    accept_multiple_files=True,
+    key="file_uploader"
 )
+
+# 如果已经完成解压等待确认，显示确认对话框
+if st.session_state.zip_extracted_confirm:
+    st.success("🎉 压缩包解压完成！")
+    if st.button("✅ 确定", type="primary"):
+        # 清除确认状态，刷新页面进入预览
+        st.session_state.zip_extracted_confirm = False
+        st.rerun()
+    st.stop()  # 暂停渲染，强制用户点击确定
 
 if uploaded_files:
     new_files = []
@@ -131,11 +137,19 @@ if uploaded_files:
                     new_files.append(csv_name)
                     st.toast(f"✅ {csv_name} 已提取 ({size_mb:.1f} MB)")
                 zip_status.update(label=f"✅ {f.name} 完成", state="complete")
+                # 标记等待确认
+                st.session_state.zip_extracted_confirm = True
+
     if new_files:
         st.session_state.current_files.extend(new_files)
+    # 如果有 ZIP 被处理并标记了确认，则停止后续渲染，显示确认对话框
+    if st.session_state.zip_extracted_confirm:
+        st.rerun()
+    else:
+        # 只有纯 CSV 上传时直接刷新预览
         st.rerun()
 
-# ---------- 显示工作区 ----------
+# ---------- 显示工作区文件 ----------
 if st.session_state.current_files:
     work_files = []
     for fname in st.session_state.current_files:
