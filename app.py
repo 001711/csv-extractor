@@ -3,13 +3,15 @@ import pandas as pd
 from io import BytesIO
 
 st.set_page_config(page_title="CSV 列提取器", layout="wide")
-st.title("📁 CSV 列提取工具（多文件直接预览，双模式防卡死）")
+st.title("📁 CSV 列提取工具（多文件预览 + 提取历史保存）")
 
 # ---------- 初始化会话状态 ----------
 if "uploaded_files_data" not in st.session_state:
     st.session_state.uploaded_files_data = {}
 if "current_files" not in st.session_state:
     st.session_state.current_files = []
+if "extract_history" not in st.session_state:
+    st.session_state.extract_history = []   # 提取历史列表，每个元素为字典
 
 # ---------- 侧边栏：模式选择 ----------
 st.sidebar.header("⚙️ 运行模式")
@@ -146,10 +148,9 @@ if st.session_state.current_files:
         st.markdown("### 📂 已加载文件")
         st.info(f"共 {len(work_files)} 个文件，总大小 {total_size:.2f} MB")
 
-        # ---- 多文件直接预览：每个文件一个折叠卡片，默认展开第一个 ----
+        # ---- 多文件直接预览 ----
         st.subheader("📄 文件预览（每个文件前100行，点击展开）")
         for idx, (fobj, size_mb) in enumerate(work_files):
-            # 默认展开第一个文件，其余折叠
             with st.expander(f"📄 {fobj.name} ({size_mb:.2f} MB)", expanded=(idx == 0)):
                 try:
                     fobj.seek(0)
@@ -161,7 +162,7 @@ if st.session_state.current_files:
 
         st.markdown("---")
 
-        # ---- 列选择（基于第一个文件，用户可通过预览确认列名一致性）----
+        # ---- 列选择 ----
         first_file = work_files[0][0]
         first_file.seek(0)
         try:
@@ -212,7 +213,6 @@ if st.session_state.current_files:
 
                     for idx, (fobj, _) in enumerate(work_files):
                         fname = fobj.name
-                        fsize = st.session_state.uploaded_files_data[fname]["size_mb"]
                         status_text.text(f"正在处理 {fname} ...")
                         try:
                             fobj.seek(0)
@@ -240,25 +240,37 @@ if st.session_state.current_files:
                             buf = BytesIO()
                             result_df.to_csv(buf, index=False)
                             data = buf.getvalue()
-                            extracted_files.append((
-                                f"extracted_{fname}",
-                                data,
-                                len(data)/1024/1024,
-                                len(result_df)
-                            ))
+                            file_mb = len(data) / (1024 * 1024)
+                            extracted_files.append({
+                                "name": f"extracted_{fname}",
+                                "data": data,
+                                "size_mb": file_mb,
+                                "rows": len(result_df)
+                            })
                         except Exception as e:
                             st.error(f"{fname} 处理失败：{str(e)[:200]}")
+
                     progress_bar.progress(1.0, "完成")
                     status_text.empty()
+
                     if extracted_files:
-                        st.success("处理完成！")
-                        for fname, fdata, fmbs, frows in extracted_files:
-                            st.download_button(
-                                f"⬇️ {fname} ({fmbs:.2f} MB)",
-                                fdata,
-                                fname,
-                                key=fname
-                            )
+                        st.success("✅ 云端提取完成！")
+                        st.subheader("📦 本次提取结果")
+                        for item in extracted_files:
+                            col1, col2 = st.columns([3, 1])
+                            with col1:
+                                st.write(f"📄 {item['name']}  |  {item['rows']:,} 行  |  {item['size_mb']:.2f} MB")
+                            with col2:
+                                st.download_button(
+                                    label="⬇️ 下载",
+                                    data=item['data'],
+                                    file_name=item['name'],
+                                    mime="text/csv",
+                                    key=f"dl_{item['name']}"
+                                )
+                            # 自动保存到提取历史
+                            st.session_state.extract_history.append(item)
+                            st.toast(f"已保存 {item['name']} 到提取历史")
                     else:
                         st.warning("没有成功处理的文件。")
 
@@ -286,3 +298,27 @@ if st.session_state.uploaded_files_data:
         st.rerun()
 else:
     st.sidebar.write("暂无已保存文件。")
+
+# ---------- 侧边栏：提取历史记录 ----------
+st.sidebar.header("📂 提取历史")
+if st.session_state.extract_history:
+    # 倒序显示，最新的在前面
+    for i, item in enumerate(reversed(st.session_state.extract_history)):
+        idx = len(st.session_state.extract_history) - 1 - i
+        with st.sidebar.expander(f"{item['name']} ({item['size_mb']:.2f} MB)"):
+            st.write(f"行数：{item['rows']:,}")
+            st.download_button(
+                label="⬇️ 下载",
+                data=item['data'],
+                file_name=item['name'],
+                mime="text/csv",
+                key=f"hist_dl_{idx}"
+            )
+            if st.button("🗑️ 删除", key=f"hist_del_{idx}"):
+                del st.session_state.extract_history[idx]
+                st.rerun()
+    if st.sidebar.button("清空提取历史"):
+        st.session_state.extract_history.clear()
+        st.rerun()
+else:
+    st.sidebar.write("暂无提取记录。")
