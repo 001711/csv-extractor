@@ -1,9 +1,11 @@
 import streamlit as st
 import pandas as pd
+import zipfile
+import os
 from io import BytesIO
 
 st.set_page_config(page_title="CSV 列提取器", layout="wide")
-st.title("📁 CSV 列提取工具（云端全量处理 · 快速预览）")
+st.title("📁 CSV 列提取工具（支持ZIP压缩包 · 极速解析 · 提取历史）")
 
 # ---------- 初始化会话状态 ----------
 if "uploaded_files_data" not in st.session_state:
@@ -38,26 +40,68 @@ chunk_size = st.sidebar.number_input(
 )
 st.sidebar.info("💡 云端将处理完整文件（全量），大文件请耐心等待。")
 
-# ---------- 主界面：上传 CSV ----------
-st.markdown("### 第一步：上传 CSV 文件（仅支持 .csv）")
+# ---------- 辅助函数：解压 ZIP ----------
+def extract_csv_from_zip(zip_file):
+    """从上传的ZIP文件中提取所有CSV，返回 [(文件名, BytesIO对象), ...]"""
+    extracted = []
+    try:
+        with zipfile.ZipFile(BytesIO(zip_file.getvalue())) as zf:
+            for name in zf.namelist():
+                # 跳过macOS系统隐藏文件和目录
+                if name.startswith('__MACOSX/') or name.startswith('._'):
+                    continue
+                if name.lower().endswith('.csv'):
+                    data = zf.read(name)
+                    # 使用纯文件名，避免路径干扰
+                    fname = os.path.basename(name)
+                    extracted.append((fname, BytesIO(data)))
+    except Exception as e:
+        st.error(f"解压 ZIP 失败：{e}")
+    return extracted
+
+# ---------- 主界面：上传 CSV / ZIP ----------
+st.markdown("### 第一步：上传 CSV 或 ZIP 压缩包")
 uploaded_files = st.file_uploader(
-    "点击选择 CSV 文件，可多选",
-    type=["csv"],
+    "点击选择文件，支持 .csv 和 .zip（可多选）",
+    type=["csv", "zip"],
     accept_multiple_files=True
 )
 
 if uploaded_files:
     new_files = []
     for f in uploaded_files:
-        if f.name not in st.session_state.uploaded_files_data:
-            data_bytes = f.getvalue()
-            size_mb = len(data_bytes) / (1024 * 1024)
-            st.session_state.uploaded_files_data[f.name] = {
-                "data": data_bytes,
-                "size_mb": size_mb
-            }
-            new_files.append(f.name)
-            st.toast(f"✅ {f.name} 已保存 ({size_mb:.1f} MB)")
+        fname_lower = f.name.lower()
+        # 处理 CSV
+        if fname_lower.endswith('.csv'):
+            if f.name not in st.session_state.uploaded_files_data:
+                data_bytes = f.getvalue()
+                size_mb = len(data_bytes) / (1024 * 1024)
+                st.session_state.uploaded_files_data[f.name] = {
+                    "data": data_bytes,
+                    "size_mb": size_mb
+                }
+                new_files.append(f.name)
+                st.toast(f"✅ {f.name} 已保存 ({size_mb:.1f} MB)")
+        # 处理 ZIP
+        elif fname_lower.endswith('.zip'):
+            extracted = extract_csv_from_zip(f)
+            for csv_name, csv_io in extracted:
+                # 避免重名覆盖（如果已存在同名文件，加后缀）
+                base, ext = os.path.splitext(csv_name)
+                final_name = csv_name
+                counter = 1
+                while final_name in st.session_state.uploaded_files_data:
+                    final_name = f"{base}_{counter}{ext}"
+                    counter += 1
+                data_bytes = csv_io.getvalue()
+                size_mb = len(data_bytes) / (1024 * 1024)
+                st.session_state.uploaded_files_data[final_name] = {
+                    "data": data_bytes,
+                    "size_mb": size_mb
+                }
+                new_files.append(final_name)
+                st.toast(f"✅ {final_name} 已从 ZIP 中提取 ({size_mb:.1f} MB)")
+
     if new_files:
         st.session_state.current_files.extend(new_files)
         st.session_state.preview_sample_interval = 0
@@ -89,8 +133,8 @@ if st.session_state.current_files:
                 try:
                     fobj.seek(0)
                     if preview_interval > 0:
-                        read_rows = preview_interval * 50   # 适度读取，保证采样后仍有内容
-                        df_raw = pd.read_csv(fobj, nrows=read_rows, engine='c')  # 使用C引擎加速
+                        read_rows = preview_interval * 50
+                        df_raw = pd.read_csv(fobj, nrows=read_rows, engine='c')
                         df_preview = df_raw.iloc[::preview_interval].head(50)
                         caption = f"应用采样间隔 {preview_interval}，显示前 {len(df_preview)} 行"
                     else:
@@ -147,14 +191,13 @@ if st.session_state.current_files:
                             chunksize=chunk_size,
                             on_bad_lines='skip',
                             encoding='utf-8',
-                            engine='c'   # 使用C引擎加速
+                            engine='c'
                         )
                         for chunk in chunk_iter:
                             if enable_sampling:
                                 chunk = chunk.iloc[::sample_interval]
                             total_rows += len(chunk)
                             output_chunks.append(chunk)
-                            # 进度更新
                             prog = min((idx + len(output_chunks) / 20) / len(work_files), 0.99)
                             progress_bar.progress(prog, f"{fname} 已读 {total_rows} 行")
                         if output_chunks:
