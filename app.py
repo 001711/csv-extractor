@@ -5,7 +5,7 @@ import os
 from io import BytesIO
 
 st.set_page_config(page_title="CSV 列提取器", layout="wide")
-st.title("📁 CSV 列提取工具（支持ZIP · 逐个解压反馈 · 提取历史）")
+st.title("📁 CSV 列提取工具（支持ZIP · 自动解压全部 · 提取历史）")
 
 # ---------- 初始化会话状态 ----------
 if "uploaded_files_data" not in st.session_state:
@@ -45,8 +45,6 @@ def extract_csv_from_zip_with_progress(zip_file, existing_names, status_containe
     """
     逐个解压ZIP中的CSV文件，显示进度，遇到重名立即停止。
     返回: (extracted_files_dict, error_message)
-    - extracted_files_dict: {文件名: BytesIO对象}
-    - error_message: 错误或重名提示，正常为None
     """
     extracted = {}
     try:
@@ -67,7 +65,7 @@ def extract_csv_from_zip_with_progress(zip_file, existing_names, status_containe
             status_container.info(f"📦 ZIP 中共发现 {total} 个 CSV 文件，开始逐个解压...")
             progress_bar = st.progress(0, text="准备解压...")
             
-            # 第二步：先检查是否有重名
+            # 第二步：检查是否有重名
             duplicates = []
             for _, fname in all_names:
                 if fname in existing_names:
@@ -79,7 +77,7 @@ def extract_csv_from_zip_with_progress(zip_file, existing_names, status_containe
             # 第三步：逐个解压并更新进度
             for idx, (arc_name, fname) in enumerate(all_names, 1):
                 progress_bar.progress(idx / total, text=f"正在解压 {idx}/{total}: {fname}")
-                # 处理重名（理论上不会进入这里，但保留检查）
+                # 处理重名（理论上不会进入，但保留）
                 final_name = fname
                 counter = 1
                 while final_name in existing_names or final_name in extracted:
@@ -128,7 +126,7 @@ if uploaded_files:
             new_files.append(f.name)
             st.toast(f"✅ {f.name} 已保存 ({size_mb:.1f} MB)")
         
-        # --- 处理 ZIP 压缩包（带进度）---
+        # --- 处理 ZIP 压缩包（带进度，自动解压全部）---
         elif fname_lower.endswith('.zip'):
             with st.status(f"正在处理压缩包 {f.name} ...", expanded=True) as zip_status:
                 extracted_dict, error_msg = extract_csv_from_zip_with_progress(
