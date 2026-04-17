@@ -3,15 +3,15 @@ import pandas as pd
 from io import BytesIO
 
 st.set_page_config(page_title="CSV 列提取器", layout="wide")
-st.title("📁 CSV 列提取工具（多文件预览 + 提取历史保存 + 累加上传）")
+st.title("📁 CSV 列提取工具（多文件预览 + 提取历史保存 + 智能跳过）")
 
 # ---------- 初始化会话状态 ----------
 if "uploaded_files_data" not in st.session_state:
     st.session_state.uploaded_files_data = {}
 if "current_files" not in st.session_state:
-    st.session_state.current_files = []          # 当前工作区文件名列表（累加）
+    st.session_state.current_files = []
 if "extract_history" not in st.session_state:
-    st.session_state.extract_history = []        # 提取历史
+    st.session_state.extract_history = []
 
 # ---------- 侧边栏：模式选择 ----------
 st.sidebar.header("⚙️ 运行模式")
@@ -28,6 +28,8 @@ sample_interval = 10
 if enable_sampling:
     sample_interval = st.sidebar.number_input("采样间隔（行数）", min_value=1, value=10)
 
+# 云端处理额外选项
+skip_existing = False
 if mode.startswith("☁️"):
     max_rows_limit = st.sidebar.number_input(
         "最大处理行数（防止卡死）",
@@ -36,6 +38,7 @@ if mode.startswith("☁️"):
     chunk_size = st.sidebar.number_input(
         "分块读取行数", min_value=5000, max_value=50000, value=20000, step=5000
     )
+    skip_existing = st.sidebar.checkbox("跳过已提取过的文件", value=True, help="若文件名已存在于提取历史，则直接复用结果，不重复处理")
     st.sidebar.warning("⚠️ 云端处理大文件极易超时，仅适合小文件或预览。")
 
 # ---------- 生成本地脚本 ----------
@@ -107,13 +110,12 @@ if __name__ == "__main__":
 '''
     return script
 
-# ---------- 主界面：上传纯 CSV（累加模式）----------
-st.markdown("### 第一步：上传 CSV 文件（仅支持 .csv，可多次上传累加）")
+# ---------- 主界面：上传纯 CSV ----------
+st.markdown("### 第一步：上传 CSV 文件（仅支持 .csv）")
 uploaded_files = st.file_uploader(
     "点击选择 CSV 文件，可多选",
     type=["csv"],
-    accept_multiple_files=True,
-    key="file_uploader"
+    accept_multiple_files=True
 )
 
 if uploaded_files:
@@ -128,27 +130,11 @@ if uploaded_files:
             }
             new_files.append(f.name)
             st.toast(f"✅ {f.name} 已保存 ({size_mb:.1f} MB)")
-        else:
-            # 文件已存在，但可能未在当前工作区
-            if f.name not in st.session_state.current_files:
-                st.session_state.current_files.append(f.name)
-                st.toast(f"📂 {f.name} 已添加到工作区")
     if new_files:
-        # 将新文件加入工作区
         st.session_state.current_files.extend(new_files)
         st.rerun()
 
-# 工作区管理按钮
-col1, col2 = st.columns([1, 5])
-with col1:
-    if st.button("🗑️ 清空工作区"):
-        st.session_state.current_files.clear()
-        st.rerun()
-with col2:
-    if st.session_state.current_files:
-        st.caption(f"当前工作区共有 {len(st.session_state.current_files)} 个文件")
-
-# ---------- 显示当前已加载文件（累加所有工作区文件）----------
+# ---------- 显示当前已加载文件 ----------
 if st.session_state.current_files:
     work_files = []
     for fname in st.session_state.current_files:
@@ -158,7 +144,6 @@ if st.session_state.current_files:
             fobj.name = fname
             work_files.append((fobj, info["size_mb"]))
         else:
-            # 如果数据丢失（理论上不会），从列表中移除
             st.session_state.current_files.remove(fname)
 
     if work_files:
@@ -221,54 +206,31 @@ if st.session_state.current_files:
 
         else:  # 云端模式
             st.markdown("### 第二步：云端处理（有限制）")
-
-            # ---- 检查哪些文件已提取过 ----
-            # 构建历史记录名称集合（提取结果名称为 extracted_原文件名）
-            history_names = {item['name'] for item in st.session_state.extract_history}
-            files_to_process = []
-            already_extracted = []
-            for fobj, sz in work_files:
-                expected_name = f"extracted_{fobj.name}"
-                if expected_name in history_names:
-                    already_extracted.append((fobj.name, expected_name))
-                else:
-                    files_to_process.append((fobj, sz))
-
-            # 显示已提取过的文件提示
-            if already_extracted:
-                st.info(f"📌 以下文件已在历史记录中提取过：{', '.join([n for n, _ in already_extracted])}")
-                with st.expander("查看已提取文件并直接下载"):
-                    for orig_name, hist_name in already_extracted:
-                        # 从历史中找到对应条目
-                        hist_item = next((item for item in st.session_state.extract_history if item['name'] == hist_name), None)
-                        if hist_item:
-                            col_a, col_b = st.columns([3, 1])
-                            with col_a:
-                                st.write(f"📄 {hist_name}  |  {hist_item['rows']:,} 行  |  {hist_item['size_mb']:.2f} MB")
-                            with col_b:
-                                st.download_button(
-                                    label="⬇️ 下载",
-                                    data=hist_item['data'],
-                                    file_name=hist_item['name'],
-                                    mime="text/csv",
-                                    key=f"hist_{hist_name}"
-                                )
-
-            # 提取按钮：仅处理未提取的文件
-            if st.button("☁️ 开始云端提取（仅处理新文件）", type="primary"):
+            if st.button("☁️ 开始云端提取", type="primary"):
                 if not selected_cols:
                     st.warning("请选择列")
-                elif not files_to_process:
-                    st.info("所有文件均已在历史中提取过，无需重复处理。")
                 else:
                     extracted_files = []
                     progress_bar = st.progress(0, "准备处理...")
                     status_text = st.empty()
-                    total_process = len(files_to_process)
 
-                    for idx, (fobj, sz) in enumerate(files_to_process):
+                    # 构建已提取文件名的集合（用于跳过）
+                    existing_names = {item["name"] for item in st.session_state.extract_history}
+
+                    for idx, (fobj, _) in enumerate(work_files):
                         fname = fobj.name
+                        out_name = f"extracted_{fname}"
                         status_text.text(f"正在处理 {fname} ...")
+
+                        # 检查是否跳过
+                        if skip_existing and out_name in existing_names:
+                            # 直接从历史中获取数据
+                            existing_item = next((item for item in st.session_state.extract_history if item["name"] == out_name), None)
+                            if existing_item:
+                                extracted_files.append(existing_item)
+                                progress_bar.progress((idx + 1) / len(work_files), f"⏭️ 跳过 {fname}（已存在）")
+                                continue
+
                         try:
                             fobj.seek(0)
                             output_chunks = []
@@ -286,7 +248,7 @@ if st.session_state.current_files:
                                     chunk = chunk.iloc[::sample_interval]
                                 total_rows += len(chunk)
                                 output_chunks.append(chunk)
-                                prog = min((idx + len(output_chunks)/10) / total_process, 0.99)
+                                prog = min((idx + len(output_chunks)/10) / len(work_files), 0.99)
                                 progress_bar.progress(prog, f"{fname} 已读 {total_rows} 行")
                             if output_chunks:
                                 result_df = pd.concat(output_chunks, ignore_index=True)
@@ -297,15 +259,14 @@ if st.session_state.current_files:
                             data = buf.getvalue()
                             file_mb = len(data) / (1024 * 1024)
                             item = {
-                                "name": f"extracted_{fname}",
+                                "name": out_name,
                                 "data": data,
                                 "size_mb": file_mb,
                                 "rows": len(result_df)
                             }
                             extracted_files.append(item)
-                            # 自动保存到提取历史
+                            # 自动保存到历史
                             st.session_state.extract_history.append(item)
-                            st.toast(f"✅ 已保存 {item['name']} 到提取历史")
                         except Exception as e:
                             st.error(f"{fname} 处理失败：{str(e)[:200]}")
 
@@ -314,7 +275,7 @@ if st.session_state.current_files:
 
                     if extracted_files:
                         st.success("✅ 云端提取完成！")
-                        st.subheader("📦 本次新提取结果")
+                        st.subheader("📦 本次提取结果")
                         for item in extracted_files:
                             col1, col2 = st.columns([3, 1])
                             with col1:
@@ -341,22 +302,16 @@ if st.session_state.uploaded_files_data:
             if st.button("📂", key=f"load_{fname}", help="加载到工作区"):
                 if fname not in st.session_state.current_files:
                     st.session_state.current_files.append(fname)
-                    st.rerun()
+                st.rerun()
         with col3:
             if st.button("🗑️", key=f"del_{fname}", help="从库中删除"):
                 del st.session_state.uploaded_files_data[fname]
                 if fname in st.session_state.current_files:
                     st.session_state.current_files.remove(fname)
-                # 同时从提取历史中移除相关条目（可选）
-                st.session_state.extract_history = [
-                    item for item in st.session_state.extract_history
-                    if item['name'] != f"extracted_{fname}"
-                ]
                 st.rerun()
     if st.sidebar.button("清空文件库"):
         st.session_state.uploaded_files_data.clear()
         st.session_state.current_files.clear()
-        st.session_state.extract_history.clear()
         st.rerun()
 else:
     st.sidebar.write("暂无已保存文件。")
