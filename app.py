@@ -3,13 +3,13 @@ import pandas as pd
 from io import BytesIO
 
 st.set_page_config(page_title="CSV 列提取器", layout="wide")
-st.title("📁 CSV 列提取工具（纯 CSV，双模式防卡死）")
+st.title("📁 CSV 列提取工具（多文件直接预览，双模式防卡死）")
 
 # ---------- 初始化会话状态 ----------
 if "uploaded_files_data" not in st.session_state:
-    st.session_state.uploaded_files_data = {}  # {文件名: {"data": bytes, "size_mb": float}}
+    st.session_state.uploaded_files_data = {}
 if "current_files" not in st.session_state:
-    st.session_state.current_files = []         # 当前工作区文件名列表
+    st.session_state.current_files = []
 
 # ---------- 侧边栏：模式选择 ----------
 st.sidebar.header("⚙️ 运行模式")
@@ -19,26 +19,24 @@ mode = st.sidebar.radio(
     help="大文件强烈建议下载脚本到本地运行，无限制、不卡死。"
 )
 
-# 采样设置（两种模式共用）
+# 采样设置
 st.sidebar.header("📊 采样设置")
 enable_sampling = st.sidebar.checkbox("启用间隔采样", value=False)
 sample_interval = 10
 if enable_sampling:
     sample_interval = st.sidebar.number_input("采样间隔（行数）", min_value=1, value=10)
 
-# 云端模式专属限制
 if mode.startswith("☁️"):
     max_rows_limit = st.sidebar.number_input(
         "最大处理行数（防止卡死）",
-        min_value=1000, max_value=100000, value=30000, step=5000,
-        help="云端内存有限，超过此行数将自动截断。"
+        min_value=1000, max_value=100000, value=30000, step=5000
     )
     chunk_size = st.sidebar.number_input(
         "分块读取行数", min_value=5000, max_value=50000, value=20000, step=5000
     )
     st.sidebar.warning("⚠️ 云端处理大文件极易超时，仅适合小文件或预览。")
 
-# ---------- 生成本地脚本（无压缩包，只处理当前文件夹下CSV）----------
+# ---------- 生成本地脚本 ----------
 def generate_local_script(selected_columns, sample_interval=0):
     script = f'''"""
 CSV 批量列提取工具 - 本地运行版
@@ -51,10 +49,9 @@ CSV 批量列提取工具 - 本地运行版
 import pandas as pd
 from pathlib import Path
 
-# 用户配置（已根据网页选择自动生成）
 SELECTED_COLUMNS = {selected_columns}
 SAMPLE_INTERVAL = {sample_interval}
-CHUNK_SIZE = 50000   # 可根据内存调整，一般无需修改
+CHUNK_SIZE = 50000
 
 INPUT_FOLDER = Path(__file__).parent
 OUTPUT_FOLDER = INPUT_FOLDER / "extracted"
@@ -116,7 +113,6 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
-# 将上传的文件存入会话状态
 if uploaded_files:
     new_files = []
     for f in uploaded_files:
@@ -135,7 +131,6 @@ if uploaded_files:
 
 # ---------- 显示当前已加载文件 ----------
 if st.session_state.current_files:
-    # 构建工作区文件对象列表
     work_files = []
     for fname in st.session_state.current_files:
         info = st.session_state.uploaded_files_data.get(fname)
@@ -151,24 +146,37 @@ if st.session_state.current_files:
         st.markdown("### 📂 已加载文件")
         st.info(f"共 {len(work_files)} 个文件，总大小 {total_size:.2f} MB")
 
-        # 预览第一个文件的前 1000 行（用于列选择）
+        # ---- 多文件直接预览：每个文件一个折叠卡片，默认展开第一个 ----
+        st.subheader("📄 文件预览（每个文件前100行，点击展开）")
+        for idx, (fobj, size_mb) in enumerate(work_files):
+            # 默认展开第一个文件，其余折叠
+            with st.expander(f"📄 {fobj.name} ({size_mb:.2f} MB)", expanded=(idx == 0)):
+                try:
+                    fobj.seek(0)
+                    df_preview = pd.read_csv(fobj, nrows=100)
+                    st.dataframe(df_preview, use_container_width=True)
+                    st.caption(f"共 {len(df_preview.columns)} 列，显示前 100 行")
+                except Exception as e:
+                    st.error(f"预览失败：{e}")
+
+        st.markdown("---")
+
+        # ---- 列选择（基于第一个文件，用户可通过预览确认列名一致性）----
         first_file = work_files[0][0]
         first_file.seek(0)
         try:
-            df_preview = pd.read_csv(first_file, nrows=1000)
+            df_first = pd.read_csv(first_file, nrows=0)
+            all_columns = df_first.columns.tolist()
         except Exception as e:
-            st.error(f"预览失败：{e}")
+            st.error(f"读取列名失败：{e}")
             st.stop()
 
-        with st.expander(f"🔎 预览 {first_file.name} (前1000行)"):
-            st.dataframe(df_preview, use_container_width=True)
-
-        all_columns = df_preview.columns.tolist()
+        st.subheader("🔧 选择要保留的列（应用于所有文件）")
         if "selected_cols" not in st.session_state:
             st.session_state.selected_cols = all_columns[: min(3, len(all_columns))]
 
         selected_cols = st.multiselect(
-            "选择要保留的列",
+            "勾选需要保留的列",
             options=all_columns,
             default=st.session_state.selected_cols
         )
@@ -210,7 +218,6 @@ if st.session_state.current_files:
                             fobj.seek(0)
                             output_chunks = []
                             total_rows = 0
-                            # 使用 nrows 限制读取行数，防止卡死
                             chunk_iter = pd.read_csv(
                                 fobj,
                                 usecols=selected_cols,
@@ -224,7 +231,6 @@ if st.session_state.current_files:
                                     chunk = chunk.iloc[::sample_interval]
                                 total_rows += len(chunk)
                                 output_chunks.append(chunk)
-                                # 简单进度更新
                                 prog = min((idx + len(output_chunks)/10) / len(work_files), 0.99)
                                 progress_bar.progress(prog, f"{fname} 已读 {total_rows} 行")
                             if output_chunks:
