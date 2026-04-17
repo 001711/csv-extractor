@@ -5,7 +5,7 @@ import os
 from io import BytesIO
 
 st.set_page_config(page_title="CSV 列提取器", layout="wide")
-st.title("📁 CSV 列提取工具（支持ZIP · 自动解压全部 · 提取历史）")
+st.title("📁 CSV 列提取工具（修复死循环 · 稳定解压）")
 
 # ---------- 初始化会话状态 ----------
 if "uploaded_files_data" not in st.session_state:
@@ -16,8 +16,6 @@ if "extract_history" not in st.session_state:
     st.session_state.extract_history = []
 if "preview_sample_interval" not in st.session_state:
     st.session_state.preview_sample_interval = 0
-if "refresh_preview" not in st.session_state:
-    st.session_state.refresh_preview = False
 
 # ---------- 侧边栏：采样设置 ----------
 st.sidebar.header("📊 采样设置")
@@ -26,82 +24,85 @@ sample_interval = 10
 if enable_sampling:
     sample_interval = st.sidebar.number_input("采样间隔（行数）", min_value=1, value=10)
 
-# 刷新预览按钮
 if st.sidebar.button("🔄 刷新预览（应用当前采样）"):
     st.session_state.preview_sample_interval = sample_interval if enable_sampling else 0
-    st.session_state.refresh_preview = True
     st.rerun()
 
-# 云端处理分块设置
 chunk_size = st.sidebar.number_input(
-    "分块读取行数（影响处理速度与内存）",
-    min_value=5000, max_value=100000, value=30000, step=5000,
-    help="每次读取的行数，大文件可适当调小以节省内存。"
+    "分块读取行数", min_value=5000, max_value=100000, value=30000, step=5000,
+    help="每次读取的行数，大文件可调小节省内存。"
 )
-st.sidebar.info("💡 云端将处理完整文件（全量），大文件请耐心等待。")
 
-# ---------- 辅助函数：解压 ZIP（计数控制循环）----------
-def extract_all_csv_from_zip(zip_file, status_container):
+# ---------- 解压安全设置 ----------
+MAX_FILES_IN_ZIP = 100  # 硬性上限，防止异常压缩包导致无限循环
+st.sidebar.info(f"💡 单个 ZIP 最多解压 {MAX_FILES_IN_ZIP} 个 CSV 文件。")
+
+# ---------- 辅助函数：稳定解压 ----------
+def extract_csv_from_zip_safe(zip_file, status_container):
     """
-    先扫描ZIP内CSV文件总数x，然后用计数器y从0累加，直到y==x停止。
-    无重名检测，无数量上限，自动重命名冲突文件。
-    返回: dict {最终文件名: BytesIO对象}
+    安全解压 ZIP，强制上限保护，单个文件失败不影响整体。
+    返回: (extracted_dict, total_in_zip, extracted_count)
     """
     extracted = {}
     try:
         with zipfile.ZipFile(BytesIO(zip_file.getvalue())) as zf:
-            # 第一步：扫描所有有效CSV文件，得到总数 x
-            all_csv_entries = []
+            # 1. 获取所有有效 CSV 条目（过滤系统文件）
+            entries = []
             for name in zf.namelist():
                 if name.startswith('__MACOSX/') or name.startswith('._'):
                     continue
                 if name.lower().endswith('.csv'):
                     fname = os.path.basename(name)
-                    all_csv_entries.append((name, fname))
+                    entries.append((name, fname))
             
-            x = len(all_csv_entries)
-            if x == 0:
+            total_in_zip = len(entries)
+            if total_in_zip == 0:
                 status_container.warning("ZIP 中没有找到 CSV 文件。")
-                return {}
+                return {}, 0, 0
             
-            status_container.info(f"📦 ZIP 中共发现 {x} 个 CSV 文件，开始逐个解压...")
+            # 2. 应用上限
+            extract_limit = min(total_in_zip, MAX_FILES_IN_ZIP)
+            status_container.info(f"📦 ZIP 中共 {total_in_zip} 个 CSV，将解压前 {extract_limit} 个...")
             progress_bar = st.progress(0, text="准备解压...")
             
-            # 用于避免本次解压内部重名（自动添加序号）
+            # 用于避免内部重名
             used_names = set()
-            y = 0
+            success_count = 0
             
-            # 第二步：逐个解压，直到 y == x
-            for arc_name, original_fname in all_csv_entries:
-                y += 1
-                progress_bar.progress(y / x, text=f"正在解压 {y}/{x}: {original_fname}")
-                
-                # 处理可能的重名（自动添加序号）
-                final_name = original_fname
-                counter = 1
-                while final_name in used_names:
-                    base, ext = os.path.splitext(original_fname)
-                    final_name = f"{base}_{counter}{ext}"
-                    counter += 1
-                used_names.add(final_name)
-                
-                data = zf.read(arc_name)
-                extracted[final_name] = BytesIO(data)
-                
-                # 当 y == x 时自然结束循环
-                
-            progress_bar.progress(1.0, text=f"✅ 解压完成，共提取 {x} 个文件")
-            status_container.success(f"✅ ZIP 解压完成，成功提取 {x} 个 CSV 文件。")
+            # 3. 逐个解压（绝对有限循环）
+            for idx, (arc_name, original_fname) in enumerate(entries[:extract_limit], 1):
+                progress_bar.progress(idx / extract_limit, text=f"解压 {idx}/{extract_limit}: {original_fname}")
+                try:
+                    data = zf.read(arc_name)
+                    # 处理重名
+                    final_name = original_fname
+                    counter = 1
+                    while final_name in used_names:
+                        base, ext = os.path.splitext(original_fname)
+                        final_name = f"{base}_{counter}{ext}"
+                        counter += 1
+                    used_names.add(final_name)
+                    extracted[final_name] = BytesIO(data)
+                    success_count += 1
+                except Exception as e:
+                    st.warning(f"跳过文件 {original_fname}：读取失败 ({str(e)[:50]})")
+                    continue
+            
+            progress_bar.progress(1.0, text="✅ 解压完成")
+            if total_in_zip > MAX_FILES_IN_ZIP:
+                status_container.success(f"✅ 已解压前 {MAX_FILES_IN_ZIP} 个文件（共 {total_in_zip} 个），达到安全上限自动停止。")
+            else:
+                status_container.success(f"✅ 成功解压 {success_count} 个 CSV 文件。")
             progress_bar.empty()
-            return extracted
+            return extracted, total_in_zip, success_count
     except Exception as e:
         status_container.error(f"解压 ZIP 失败：{e}")
-        return {}
+        return {}, 0, 0
 
-# ---------- 主界面：上传 CSV / ZIP ----------
+# ---------- 主界面：上传 ----------
 st.markdown("### 第一步：上传 CSV 或 ZIP 压缩包")
 uploaded_files = st.file_uploader(
-    "点击选择文件，支持 .csv 和 .zip（可多选）",
+    "支持 .csv 和 .zip（可多选）",
     type=["csv", "zip"],
     accept_multiple_files=True
 )
@@ -110,43 +111,27 @@ if uploaded_files:
     new_files = []
     for f in uploaded_files:
         fname_lower = f.name.lower()
-        
-        # --- 处理单个 CSV ---
         if fname_lower.endswith('.csv'):
             data_bytes = f.getvalue()
             size_mb = len(data_bytes) / (1024 * 1024)
-            # 直接保存，若重名则提示覆盖
-            if f.name in st.session_state.uploaded_files_data:
-                st.warning(f"文件 {f.name} 已存在，将覆盖旧文件。")
-            st.session_state.uploaded_files_data[f.name] = {
-                "data": data_bytes,
-                "size_mb": size_mb
-            }
+            st.session_state.uploaded_files_data[f.name] = {"data": data_bytes, "size_mb": size_mb}
             new_files.append(f.name)
             st.toast(f"✅ {f.name} 已保存 ({size_mb:.1f} MB)")
-        
-        # --- 处理 ZIP 压缩包（纯计数控制）---
         elif fname_lower.endswith('.zip'):
-            with st.status(f"正在处理压缩包 {f.name} ...", expanded=True) as zip_status:
-                extracted_dict = extract_all_csv_from_zip(f, zip_status)
+            with st.status(f"处理 {f.name} ...", expanded=True) as zip_status:
+                extracted_dict, total, success = extract_csv_from_zip_safe(f, zip_status)
                 for csv_name, csv_io in extracted_dict.items():
                     data_bytes = csv_io.getvalue()
                     size_mb = len(data_bytes) / (1024 * 1024)
-                    st.session_state.uploaded_files_data[csv_name] = {
-                        "data": data_bytes,
-                        "size_mb": size_mb
-                    }
+                    st.session_state.uploaded_files_data[csv_name] = {"data": data_bytes, "size_mb": size_mb}
                     new_files.append(csv_name)
-                    st.toast(f"✅ {csv_name} 已从 ZIP 提取 ({size_mb:.1f} MB)")
-                zip_status.update(label=f"✅ {f.name} 处理完成", state="complete")
-
+                    st.toast(f"✅ {csv_name} 已提取 ({size_mb:.1f} MB)")
+                zip_status.update(label=f"✅ {f.name} 完成", state="complete")
     if new_files:
         st.session_state.current_files.extend(new_files)
-        st.session_state.preview_sample_interval = 0
-        st.session_state.refresh_preview = False
-    st.rerun()
+        st.rerun()
 
-# ---------- 显示当前工作区文件 ----------
+# ---------- 显示工作区 ----------
 if st.session_state.current_files:
     work_files = []
     for fname in st.session_state.current_files:
@@ -163,9 +148,8 @@ if st.session_state.current_files:
         st.markdown("### 📂 已加载文件")
         st.info(f"共 {len(work_files)} 个文件，总大小 {total_size:.2f} MB")
 
-        st.subheader("📄 文件预览（每个文件前 50 行，点击刷新可应用采样）")
+        st.subheader("📄 文件预览（前 50 行）")
         preview_interval = st.session_state.preview_sample_interval
-
         for idx, (fobj, size_mb) in enumerate(work_files):
             with st.expander(f"📄 {fobj.name} ({size_mb:.2f} MB)", expanded=(idx == 0)):
                 try:
@@ -184,8 +168,6 @@ if st.session_state.current_files:
                     st.error(f"预览失败：{e}")
 
         st.markdown("---")
-
-        # 列选择（基于第一个文件）
         first_file = work_files[0][0]
         first_file.seek(0)
         try:
@@ -195,27 +177,21 @@ if st.session_state.current_files:
             st.error(f"读取列名失败：{e}")
             st.stop()
 
-        st.subheader("🔧 选择要保留的列（应用于所有文件）")
+        st.subheader("🔧 选择要保留的列")
         if "selected_cols" not in st.session_state:
             st.session_state.selected_cols = all_columns[: min(3, len(all_columns))]
-
-        selected_cols = st.multiselect(
-            "勾选需要保留的列",
-            options=all_columns,
-            default=st.session_state.selected_cols
-        )
+        selected_cols = st.multiselect("勾选需要保留的列", options=all_columns, default=st.session_state.selected_cols)
         st.session_state.selected_cols = selected_cols
 
         # ---------- 云端全量处理 ----------
         st.markdown("### 第二步：云端全量提取")
-        if st.button("☁️ 开始云端提取（处理完整文件）", type="primary"):
+        if st.button("☁️ 开始云端提取", type="primary"):
             if not selected_cols:
                 st.warning("请至少选择一列。")
             else:
                 extracted_files = []
                 progress_bar = st.progress(0, "准备处理...")
                 status_text = st.empty()
-
                 for idx, (fobj, _) in enumerate(work_files):
                     fname = fobj.name
                     status_text.text(f"正在处理 {fname} ...")
@@ -223,14 +199,8 @@ if st.session_state.current_files:
                         fobj.seek(0)
                         output_chunks = []
                         total_rows = 0
-                        chunk_iter = pd.read_csv(
-                            fobj,
-                            usecols=selected_cols,
-                            chunksize=chunk_size,
-                            on_bad_lines='skip',
-                            encoding='utf-8',
-                            engine='c'
-                        )
+                        chunk_iter = pd.read_csv(fobj, usecols=selected_cols, chunksize=chunk_size,
+                                                 on_bad_lines='skip', encoding='utf-8', engine='c')
                         for chunk in chunk_iter:
                             if enable_sampling:
                                 chunk = chunk.iloc[::sample_interval]
@@ -246,82 +216,53 @@ if st.session_state.current_files:
                         result_df.to_csv(buf, index=False)
                         data = buf.getvalue()
                         file_mb = len(data) / (1024 * 1024)
-                        extracted_files.append({
-                            "name": f"extracted_{fname}",
-                            "data": data,
-                            "size_mb": file_mb,
-                            "rows": len(result_df)
-                        })
+                        extracted_files.append({"name": f"extracted_{fname}", "data": data,
+                                                "size_mb": file_mb, "rows": len(result_df)})
                     except Exception as e:
                         st.error(f"{fname} 处理失败：{str(e)[:200]}")
-
                 progress_bar.progress(1.0, "完成")
                 status_text.empty()
-
                 if extracted_files:
-                    st.success("✅ 云端提取完成！")
-                    st.subheader("📦 本次提取结果")
+                    st.success("✅ 提取完成！")
+                    st.subheader("📦 本次结果")
                     for item in extracted_files:
                         col1, col2 = st.columns([3, 1])
-                        with col1:
-                            st.write(f"📄 {item['name']}  |  {item['rows']:,} 行  |  {item['size_mb']:.2f} MB")
-                        with col2:
-                            st.download_button(
-                                label="⬇️ 下载",
-                                data=item['data'],
-                                file_name=item['name'],
-                                mime="text/csv",
-                                key=f"dl_{item['name']}"
-                            )
+                        col1.write(f"📄 {item['name']}  |  {item['rows']:,} 行  |  {item['size_mb']:.2f} MB")
+                        col2.download_button("⬇️ 下载", data=item['data'], file_name=item['name'], key=f"dl_{item['name']}")
                         st.session_state.extract_history.append(item)
-                        st.toast(f"已保存 {item['name']} 到提取历史")
                 else:
                     st.warning("没有成功处理的文件。")
 
-# ---------- 侧边栏：文件库管理 ----------
+# ---------- 侧边栏：文件库 & 历史 ----------
 st.sidebar.header("📤 文件库")
 if st.session_state.uploaded_files_data:
     for fname, info in list(st.session_state.uploaded_files_data.items()):
-        col1, col2, col3 = st.sidebar.columns([3, 1, 1])
-        with col1:
-            st.write(f"📄 {fname} ({info['size_mb']:.1f} MB)")
-        with col2:
-            if st.button("📂", key=f"load_{fname}", help="加载到工作区"):
-                if fname not in st.session_state.current_files:
-                    st.session_state.current_files.append(fname)
-                st.rerun()
-        with col3:
-            if st.button("🗑️", key=f"del_{fname}", help="从库中删除"):
-                del st.session_state.uploaded_files_data[fname]
-                if fname in st.session_state.current_files:
-                    st.session_state.current_files.remove(fname)
-                st.rerun()
+        col1, col2, col3 = st.sidebar.columns([3,1,1])
+        col1.write(f"📄 {fname} ({info['size_mb']:.1f} MB)")
+        if col2.button("📂", key=f"load_{fname}"):
+            if fname not in st.session_state.current_files:
+                st.session_state.current_files.append(fname)
+            st.rerun()
+        if col3.button("🗑️", key=f"del_{fname}"):
+            del st.session_state.uploaded_files_data[fname]
+            if fname in st.session_state.current_files:
+                st.session_state.current_files.remove(fname)
+            st.rerun()
     if st.sidebar.button("清空文件库"):
         st.session_state.uploaded_files_data.clear()
         st.session_state.current_files.clear()
         st.rerun()
-else:
-    st.sidebar.write("暂无已保存文件。")
 
-# ---------- 侧边栏：提取历史记录 ----------
 st.sidebar.header("📂 提取历史")
 if st.session_state.extract_history:
     for i, item in enumerate(reversed(st.session_state.extract_history)):
         idx = len(st.session_state.extract_history) - 1 - i
         with st.sidebar.expander(f"{item['name']} ({item['size_mb']:.2f} MB)"):
             st.write(f"行数：{item['rows']:,}")
-            st.download_button(
-                label="⬇️ 下载",
-                data=item['data'],
-                file_name=item['name'],
-                mime="text/csv",
-                key=f"hist_dl_{idx}"
-            )
+            st.download_button("⬇️ 下载", data=item['data'], file_name=item['name'], key=f"hist_dl_{idx}")
             if st.button("🗑️ 删除", key=f"hist_del_{idx}"):
                 del st.session_state.extract_history[idx]
                 st.rerun()
     if st.sidebar.button("清空提取历史"):
         st.session_state.extract_history.clear()
         st.rerun()
-else:
-    st.sidebar.write("暂无提取记录。")
